@@ -149,7 +149,7 @@ def save_master_password(hashed_data):
     with open(AUTH_FILE, "wb") as f:
         f.write(hashed_data)
     if os.name == "nt":
-        subprocess.run(['attrib', '-h', AUTH_FILE], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['attrib', '+h', AUTH_FILE], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # Get contents of the auth file
@@ -204,62 +204,70 @@ def load_authenticated_vault() -> tuple[dict, bytes] | None:
     return vault, fernet_key
 #Export the vault
 def export_vault(destination_path: str):
-    if not os.path.exists(VAULT_FILE):
-        print("No vault file to export.")
+    if not os.path.exists(VAULT_FILE) or not auth_exists():
+        print("No vault file or auth data to export.")
         return
     try:
+        # Load the salt from the local AUTH_FILE
+        auth_data = load_master_password()
+        salt = auth_data[:SALT_SIZE]
+
+        # Load the encrypted vault data
         with open(VAULT_FILE, "rb") as f_src:
-            data = f_src.read()
+            vault_data = f_src.read()
+
+        # Combine them: [SALT][ENCRYPTED_DATA]
         with open(destination_path, "wb") as f_dst:
-            f_dst.write(data)
-        print(f"Vault exported to {destination_path}")
+            f_dst.write(salt + vault_data)
+            
+        print(f"Vault exported successfully to {destination_path}")
     except Exception as e:
         print(f"Failed to export vault: {e}")
 
-def import_vault(path: str, fernet_key: bytes):
+def import_vault(path: str, local_fernet_key: bytes):
     if not os.path.exists(path):
         print("Provided import file does not exist.")
         return
 
     try:
         with open(path, "rb") as f:
-            imported_data = f.read()
-    except (OSError, IOError) as e:
-        print(f"Failed to read import file: {e}")
-        return
+            raw_import_data = f.read()
+            
+        # 1. Extract the salt from the first SALT_SIZE bytes
+        imported_salt = raw_import_data[:SALT_SIZE]
+        encrypted_vault_blob = raw_import_data[SALT_SIZE:]
 
-    try:
-        imported_fernet = Fernet(fernet_key)
-        imported_vault = json.loads(imported_fernet.decrypt(imported_data).decode())
+        # 2. Derive the key that was used on the ORIGINAL device
+        # We need the password to combine with the imported salt
+        pw = getpass.getpass("Enter master password for the imported file: ")
+        imported_device_key = derive_fernet_key(pw, imported_salt)
+        
+        # 3. Decrypt using the imported device's key
+        import_cipher = Fernet(imported_device_key)
+        decrypted_raw = import_cipher.decrypt(encrypted_vault_blob)
+        imported_vault = json.loads(decrypted_raw.decode())
+
     except InvalidToken:
-        print("Failed to decrypt imported vault. Check master password.")
+        print("Failed to decrypt imported vault. Incorrect password or corrupted file.")
         return
-    except json.JSONDecodeError:
-        print("Decrypted data is not valid JSON.")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print("Imported data is corrupted or not valid JSON.")
         return
-    except UnicodeDecodeError:
-        print("Decrypted data is not valid UTF-8.")
+    except Exception as e:
+        print(f"Failed to read or decrypt import file: {e}")
         return
 
-    # Load current vault or create empty one
     if os.path.exists(VAULT_FILE):
         try:
-            current_vault = load_encrypted_vault(fernet_key)
-        except InvalidToken:
-            print("Warning: Failed to decrypt existing vault with current key.")
-            current_vault = {}
-        except json.JSONDecodeError:
-            print("Warning: Existing vault is not valid JSON. Starting with an empty vault.")
-            current_vault = {}
-        except Exception as e:
-            print(f"Warning: Unexpected error loading current vault: {e}")
+            current_vault = load_encrypted_vault(local_fernet_key)
+        except Exception:
+            print("Warning: Failed to decrypt existing local vault. Starting with empty.")
             current_vault = {}
     else:
         current_vault = {}
 
     added = 0
     skipped = 0
-
     for service, entries in imported_vault.items():
         if service not in current_vault:
             current_vault[service] = entries
@@ -270,15 +278,12 @@ def import_vault(path: str, fernet_key: bytes):
                     current_vault[service][user] = pwd
                     added += 1
                 else:
-                    print(f"Skipped duplicate entry: {service} → {user}")
                     skipped += 1
 
-    if save_encrypted_vault(current_vault, fernet_key):
-        print("Password added successfully.")
+    if save_encrypted_vault(current_vault, local_fernet_key):
+        print(f"Import complete. Added: {added}, Skipped: {skipped} duplicates.")
     else:
-        print("Failed to save password.")
-
-    print(f"Imported vault successfully. Added: {added}, Skipped: {skipped}")
+        print("Failed to save merged vault.")
 
 def import_txt_file(filepath: str, fernet_key: bytes):
     if not os.path.exists(filepath):
