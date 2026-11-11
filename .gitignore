@@ -4,8 +4,6 @@ NewPasswords
 NewPasswords
 *.txt
 *.log
-*.md
-*.MD
 venv/*
 n_pass 
 *.bin
